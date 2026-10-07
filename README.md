@@ -6,7 +6,7 @@ Terminal mods for [Claude Code](https://code.claude.com), packaged as a plugin m
 
 An orange heads-up display for the Claude Code terminal.
 
-- **Side pane** (docked right in the fullscreen layout): Claude Code version, model, effort, permission mode, context and rate-limit gauges, cost, prompts and session time, working directory, git branch with changes and upstream drift, current kube context, and every subagent with its status, tools and timing.
+- **Side pane** (docked right in the fullscreen layout): Claude Code version, model, effort, context and rate-limit gauges, cost, prompts and session time, working directory, git branch with changes and upstream drift, current kube context, and every subagent with its status, tools and timing.
 - **Turn folding**: the intermediate text and tool calls of each turn collapse into one line under your prompt until the final answer or a question. Click the line to expand it, or run `/thoughts` to expand or fold every turn.
 - **Restyled transcript**: your prompts as grey cards, and replies with orange headings, bullets and numbering, code in highlighted cards, and dimmed quotes.
 

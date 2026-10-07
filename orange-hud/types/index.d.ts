@@ -62,7 +62,6 @@ declare module 'claude-code' {
       hint: string
       agents: AgentRow[]
       now: number
-      permissionMode: string | null
       effort: string | null
       groupOf: StateFamily<string | null>
       turnGroup: StateFamily<TurnGroupView | null>

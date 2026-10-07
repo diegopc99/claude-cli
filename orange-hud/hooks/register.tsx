@@ -12,8 +12,7 @@ import type {
 import type { AgentRow, AgentStatusLabel, GitState, HudInfo, RateLimitGauge, TurnGroupView } from '../types'
 
 type SiteInput = RenderInput<'Pane'> | RenderInput<'AbovePrompt'>
-type ModeStyle = { label: string; color: Color }
-type ClassicSessionFields = { permission_mode?: string; effort?: { level: string }; agent_id?: string }
+type ClassicSessionFields = { effort?: { level: string }; agent_id?: string }
 type TranscriptInput =
   | RenderInput<'AssistantMessage'>
   | RenderInput<'ToolUse'>
@@ -31,8 +30,6 @@ const CODE_CARD = '#262626'
 const SECTION_INDENT = 2
 const PANE = 'hud'
 const PANE_COLUMNS = 46
-// Widest engine mode indicator, "⏵⏵ bypass permissions on · ", with room to spare.
-const MODE_COVER_COLUMNS = 30
 const MAX_AGENTS = 50
 const INFO_MS = 5_000
 const POLL_MS = 1_000
@@ -54,20 +51,10 @@ const MASCOT: ReadonlyArray<ReadonlyArray<{ glyphs: string; isEye?: true }>> = [
   [{ glyphs: ' ▝▝   ▝▝ ' }],
 ]
 
-const MODE_STYLES: Record<string, ModeStyle> = {
-  auto: { label: '⏵⏵ AUTO MODE', color: ORANGE },
-  acceptEdits: { label: '⏵⏵ ACCEPT EDITS', color: 'autoAccept' },
-  plan: { label: '⏸ PLAN MODE', color: 'planMode' },
-  bypassPermissions: { label: '⚠ BYPASS PERMISSIONS', color: 'error' },
-  dontAsk: { label: "⏵ DON'T ASK", color: 'warning' },
-  default: { label: '● DEFAULT MODE', color: 'inactive' },
-}
-
 const info = atom({ plugin: 'orange-hud', key: 'info' } as const, null)
 const hint = atom({ plugin: 'orange-hud', key: 'hint' } as const, '')
 const agents = atom({ plugin: 'orange-hud', key: 'agents' } as const, [])
 const now = atom({ plugin: 'orange-hud', key: 'now' } as const, 0)
-const permissionMode = atom({ plugin: 'orange-hud', key: 'permissionMode' } as const, null)
 const effort = atom({ plugin: 'orange-hud', key: 'effort' } as const, null)
 const groupOf = atom({ plugin: 'orange-hud', key: 'groupOf' } as const, null)
 const turnGroup = atom({ plugin: 'orange-hud', key: 'turnGroup' } as const, null)
@@ -378,11 +365,6 @@ async function attempt<T>(work: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
-async function storePermissionMode($: EngineInterface, value: string): Promise<void> {
-  if ((await read($, permissionMode)) === value) return
-  await update($, permissionMode, () => value)
-}
-
 async function storeEffort($: EngineInterface, value: string): Promise<void> {
   if ((await read($, effort)) === value) return
   await update($, effort, () => value)
@@ -481,7 +463,6 @@ function queueRefresh($: EngineInterface): void {
 
 function noteSession($: EngineInterface, e: ClassicSessionFields): void {
   if (e.agent_id !== undefined) return
-  if (e.permission_mode) void storePermissionMode($, e.permission_mode)
   if (e.effort?.level) void storeEffort($, e.effort.level)
 }
 
@@ -714,19 +695,10 @@ function gauge($: EngineInterface, e: SiteInput, label: string, percent: number,
   )
 }
 
-function modePill($: EngineInterface, e: SiteInput, mode: string | null): RenderElement | null {
-  if (mode === null) return null
-  const { Text } = $.ui.resolve(e)
-  const style = MODE_STYLES[mode] ?? { label: mode.toUpperCase(), color: 'inactive' }
-
-  return <Text backgroundColor={style.color} color="inverseText" bold>{` ${style.label} `}</Text>
-}
-
 function headerCard(
   $: EngineInterface,
   e: SiteInput,
   hud: HudInfo | null,
-  mode: string | null,
   effortLevel: string | null,
 ): RenderElement {
   const { Box, Text } = $.ui.resolve(e)
@@ -765,14 +737,11 @@ function headerCard(
           <Text dimColor wrap="truncate-end">{hud === null ? '' : cwdLabel(hud)}</Text>
         </Box>
       </Box>
-      <Box justifyContent="space-between" marginTop={1} gap={1}>
-        <Box flexShrink={0}>{modePill($, e, mode) ?? <Text dimColor>◌ mode on next prompt</Text>}</Box>
-        {hud?.caveman ? (
-          <Box flexShrink={1}>
-            <Text color={ORANGE} wrap="truncate-start">{hud.caveman}</Text>
-          </Box>
-        ) : null}
-      </Box>
+      {hud?.caveman ? (
+        <Box marginTop={1}>
+          <Text color={ORANGE} wrap="truncate-start">{hud.caveman}</Text>
+        </Box>
+      ) : null}
     </Box>
   )
 }
@@ -905,7 +874,6 @@ function compactCard(
   $: EngineInterface,
   e: SiteInput,
   hud: HudInfo | null,
-  mode: string | null,
   hintText: string,
 ): RenderElement {
   const { Box, Text } = $.ui.resolve(e)
@@ -913,20 +881,17 @@ function compactCard(
 
   return (
     <Box flexDirection="column" width={e.props.bodyColumns} borderStyle="bold" borderColor={ORANGE} paddingX={1}>
-      <Box justifyContent="space-between" gap={1}>
-        <Box gap={1} flexShrink={1}>
-          <Box flexShrink={1}>
-            <Text color={ORANGE} bold wrap="truncate-end">
-              ◆ {hud === null || hud.model === '' ? 'Claude' : modelLabel(hud.model)}
-            </Text>
-          </Box>
-          {hud?.caveman ? (
-            <Box flexShrink={1}>
-              <Text color={ORANGE} wrap="truncate-start">{hud.caveman}</Text>
-            </Box>
-          ) : null}
+      <Box gap={1}>
+        <Box flexShrink={1}>
+          <Text color={ORANGE} bold wrap="truncate-end">
+            ◆ {hud === null || hud.model === '' ? 'Claude' : modelLabel(hud.model)}
+          </Text>
         </Box>
-        <Box flexShrink={0}>{modePill($, e, mode)}</Box>
+        {hud?.caveman ? (
+          <Box flexShrink={1}>
+            <Text color={ORANGE} wrap="truncate-start">{hud.caveman}</Text>
+          </Box>
+        ) : null}
       </Box>
       {hud !== null && hud.cwd !== '' ? (
         <Box justifyContent="space-between" gap={1}>
@@ -1149,27 +1114,18 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The hint is drawn in the HUD instead. A render hook may
-  // not write state, so the captured text is handed over from a timer. The
-  // engine strips the permission mode out of this hint, so it never says one.
+  // The hint is drawn in the HUD instead. A render hook may not write state, so
+  // the captured text is handed over from a timer. The engine keeps drawing the
+  // permission mode beside this site, where it stays.
   on('ui.render', { component: 'PromptHint' }, ($, e) => {
     const text = e.props.hint
     if (text !== lastHint) {
       lastHint = text
       $.clock.after(1, () => void update($, hint, () => text))
     }
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box } = $.ui.resolve(e)
 
-    // Once a hook draws this site the engine still prints "⏵⏵ <mode> on · "
-    // just left of it, and nothing in the API turns that off. Blanks painted
-    // there cover it; only the fullscreen layout lets them reach past the site.
-    return (
-      <Box>
-        <Box position="absolute" left={-MODE_COVER_COLUMNS} top={0}>
-          <Text>{' '.repeat(MODE_COVER_COLUMNS)}</Text>
-        </Box>
-      </Box>
-    )
+    return <Box />
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -1183,14 +1139,9 @@ export const register: Register = on => {
       $.clock.after(1, () => void openPane($, false))
     }
 
-    const [hud, hintText, mode, isInPane] = await Promise.all([
-      read($, info),
-      read($, hint),
-      read($, permissionMode),
-      isHudInPane($),
-    ])
+    const [hud, hintText, isInPane] = await Promise.all([read($, info), read($, hint), isHudInPane($)])
     if (hud === null) queueRefresh($)
-    if (!isInPane) return compactCard($, e, hud, mode, hintText)
+    if (!isInPane) return compactCard($, e, hud, hintText)
     if (hintText === '') return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
@@ -1204,18 +1155,17 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box } = $.ui.resolve(e)
-    const [hud, rows, at, mode, effortLevel] = await Promise.all([
+    const [hud, rows, at, effortLevel] = await Promise.all([
       read($, info),
       read($, agents),
       read($, now),
-      read($, permissionMode),
       read($, effort),
     ])
     if (hud === null) queueRefresh($)
 
     return (
       <Box flexDirection="column" width={e.props.bodyColumns}>
-        {headerCard($, e, hud, mode, effortLevel)}
+        {headerCard($, e, hud, effortLevel)}
         {sessionSection($, e, hud)}
         {workspaceSection($, e, hud)}
         {agentsSection($, e, rows, at)}

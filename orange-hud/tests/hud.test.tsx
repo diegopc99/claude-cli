@@ -53,47 +53,14 @@ describe('side pane header', () => {
     expect(await pane.find({ text: /projects/ })).toBeUndefined()
   })
 
-  test('keeps the session mode when the prompt hint redraws without it', async ($, on) => {
-    const clock = mock.clock(on)
-    on('classic.UserPromptSubmit', () => ({}))
-    await $.classic.UserPromptSubmit({ prompt: 'hi', permission_mode: 'auto' })
-    // The engine strips "auto mode on" from the hint it hands plugins, so the
-    // hint alone reads like the default mode's line.
-    await $.ui.mount({
-      plugin: 'orange-hud',
-      surface: 'terminal',
-      component: 'PromptHint',
-      props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
-    })
-    await clock.advance(5)
-
-    const pane = await $.ui.mount(PANE)
-    expect(await pane.find({ text: /AUTO MODE/ })).toBeDefined()
-    expect(await pane.find({ text: /DEFAULT MODE/ })).toBeUndefined()
-  })
-
-  test('takes the mode the session started in', async ($, on) => {
-    const clock = mock.clock(on)
-    on('classic.SessionStart', () => ({}))
-    await $.classic.SessionStart({ source: 'startup', permission_mode: 'auto' })
-    await clock.advance(5)
-
-    const pane = await $.ui.mount(PANE)
-    expect(await pane.find({ text: /AUTO MODE/ })).toBeDefined()
-  })
-
-  test('takes the permission mode and effort from the session events', async ($, on) => {
+  test('takes the effort from the session events and shows no permission mode', async ($, on) => {
     const clock = mock.clock(on)
     on('classic.UserPromptSubmit', () => ({}))
     const pane = await $.ui.mount(PANE)
-    await $.classic.UserPromptSubmit({
-      prompt: 'hi',
-      permission_mode: 'plan',
-      effort: { level: 'max' },
-    })
+    await $.classic.UserPromptSubmit({ prompt: 'hi', permission_mode: 'plan', effort: { level: 'max' } })
     await clock.advance(5)
-    expect(await pane.find({ text: /PLAN MODE/ })).toBeDefined()
     expect(await pane.find({ text: /effort max/ })).toBeDefined()
+    expect(await pane.find({ text: /MODE|mode on next prompt/ })).toBeUndefined()
   })
 })
 
@@ -191,8 +158,6 @@ describe('side pane sections', () => {
 describe('band above the prompt', () => {
   test('carries a compact HUD and the prompt hint while the side pane is not shown', async ($, on) => {
     const clock = mock.clock(on)
-    on('classic.UserPromptSubmit', () => ({}))
-    await $.classic.UserPromptSubmit({ prompt: 'hi', permission_mode: 'auto' })
     const below = await $.ui.mount({
       plugin: 'orange-hud',
       surface: 'terminal',
@@ -200,9 +165,7 @@ describe('band above the prompt', () => {
       props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
     })
     expect(await below.find({ text: /shortcuts/ })).toBeUndefined()
-    const cover = JSON.stringify(await below.drawn())
-    expect(cover).toContain('"position":"absolute"')
-    expect(cover).toContain('"left":-30')
+    expect(JSON.stringify(await below.drawn())).not.toContain('"position":"absolute"')
 
     await clock.advance(5)
     const band = await $.ui.mount({
@@ -213,7 +176,6 @@ describe('band above the prompt', () => {
     })
     expect(await band.find({ text: /◆ Claude/ })).toBeDefined()
     expect(await band.find({ text: /\? for shortcuts/ })).toBeDefined()
-    expect(await band.find({ text: /AUTO MODE/ })).toBeDefined()
   })
 
   test('shrinks to the hint line while the side pane shows the HUD', async ($, on) => {
