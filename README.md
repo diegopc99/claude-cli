@@ -33,6 +33,7 @@ Answer `y` to add the marketplace, then pick the user scope. The mod is active r
 - The side pane docks in the fullscreen layout from 110 columns (144 when it opens on its own); elsewhere the HUD shows above the prompt.
 - Colours are tuned for the dark theme. UI labels are in Spanish.
 - It does not remove a configured `statusLine`; that keeps drawing under the prompt.
+- The side pane stays open: its × is drawn by Claude Code and cannot be hidden, so the mod ignores it.
 - Every 5 seconds it runs `git --no-optional-locks -c core.fsmonitor=false status` and `kubectl config current-context` in the session's directory. Both are optional: without git or kubectl those rows are simply not shown.
 - No network access. Text from outside the session (kube contexts, branch names, agent descriptions) is stripped of control characters before it is drawn.
 

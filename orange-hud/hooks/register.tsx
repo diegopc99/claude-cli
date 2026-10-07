@@ -984,6 +984,9 @@ export const register: Register = on => {
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
+    // The frame's close mark cannot be hidden, so the person's close is refused:
+    // answering without next keeps the pane open.
+    if (e.origin.kind === 'person') return { value: undefined }
     const closed = await next(e)
     $.ui.invalidate('ui.render')
 
