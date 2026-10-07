@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+# Laid by Claude Code when it loads the mod; regenerated per version.
+orange-hud/.claude-plugin/types/
