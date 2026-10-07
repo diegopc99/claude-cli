@@ -387,6 +387,60 @@ async function kubeContext($: EngineInterface): Promise<string | null> {
   return run.exitCode === 0 ? printable(run.stdout.trim()) || null : null
 }
 
+const TITLE_PATTERN = '"(customTitle|aiTitle)":"([^"\\\\]|\\\\.)*"'
+let transcript: { id: string; path: string } | undefined
+// The title last read, keyed by the transcript's size and mtime: re-read only once the file changed.
+let titleCache: { id: string; stamp: string; title: string | null } | undefined
+
+// The title a /rename set wins over the one Claude Code generated; both are the
+// latest of their kind in the transcript lines `grep` hands back.
+export function pickSessionTitle(lines: readonly string[]): string | null {
+  let custom: string | null = null
+  let generated: string | null = null
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(`{${line}}`) as { customTitle?: unknown; aiTitle?: unknown }
+      if (typeof entry.customTitle === 'string') custom = entry.customTitle
+      if (typeof entry.aiTitle === 'string') generated = entry.aiTitle
+    } catch {
+      // a line grep cut mid-escape is skipped
+    }
+  }
+  const title = printable(custom ?? generated ?? '').trim()
+  return title === '' ? null : title
+}
+
+export function isTitleFresh(
+  cache: { id: string; stamp: string } | undefined,
+  id: string,
+  stamp: string,
+): boolean {
+  return cache !== undefined && cache.id === id && cache.stamp === stamp
+}
+
+// No API carries the session's name, so it is read off the transcript. The file
+// outgrows $.fs.read's limit, so grep returns only the title entries.
+async function sessionTitle($: EngineInterface, configDir: string): Promise<string | null> {
+  const id = await $.session.id()
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return null
+  if (transcript?.id !== id) {
+    const found = await $.process.run(
+      ['find', `${configDir}/projects`, '-maxdepth', '2', '-name', `${id}.jsonl`, '-print', '-quit'],
+      { timeoutMs: 3_000 },
+    )
+    const path = found.exitCode === 0 ? found.stdout.trim() : ''
+    if (path === '') return null
+    transcript = { id, path }
+  }
+  const stat = await $.fs.stat(transcript.path)
+  const stamp = `${stat.size}:${stat.mtimeMs}`
+  if (titleCache !== undefined && isTitleFresh(titleCache, id, stamp)) return titleCache.title
+  const run = await $.process.run(['grep', '-a', '-o', '-E', TITLE_PATTERN, transcript.path], { timeoutMs: 3_000 })
+  const title = run.exitCode === 0 ? pickSessionTitle(run.stdout.split('\n').filter(line => line !== '')) : null
+  titleCache = { id, stamp, title }
+  return title
+}
+
 // Mirrors ~/.claude/hooks/caveman-statusline.sh, which the HUD replaces; the
 // flag text is reduced to [a-z0-9-] so nothing from the file reaches the terminal raw.
 async function cavemanBadge($: EngineInterface, configDir: string): Promise<string | null> {
@@ -401,10 +455,16 @@ async function cavemanBadge($: EngineInterface, configDir: string): Promise<stri
   return savings === '' ? badge : `${badge} ${savings}`
 }
 
+async function configDirOf($: EngineInterface, home: string | undefined): Promise<string | undefined> {
+  const explicit = await attempt(() => $.env.get('CLAUDE_CONFIG_DIR'), undefined)
+  return explicit ?? (home === undefined ? undefined : `${home}/.claude`)
+}
+
 async function collectInfo($: EngineInterface): Promise<HudInfo> {
   const home = await attempt(() => $.env.get('HOME'), undefined)
-  const configDir = (await attempt(() => $.env.get('CLAUDE_CONFIG_DIR'), undefined)) ?? (home === undefined ? undefined : `${home}/.claude`)
-  const [version, model, cwd, usage, git, kube, prompts, settings, caveman, fetchedAt] = await Promise.all([
+  const configDir = await configDirOf($, home)
+  const fetchedAt = await $.clock.now()
+  const [version, model, cwd, usage, git, kube, prompts, settings, caveman, title] = await Promise.all([
     attempt(async () => (await $.session.version()).version, ''),
     attempt(() => $.session.model(), ''),
     attempt(() => $.session.cwd(), ''),
@@ -414,7 +474,7 @@ async function collectInfo($: EngineInterface): Promise<HudInfo> {
     attempt(() => $.session.turns(), null),
     attempt(() => $.settings.read(), {}),
     configDir === undefined ? Promise.resolve(null) : attempt(() => cavemanBadge($, configDir), null),
-    $.clock.now(),
+    configDir === undefined ? Promise.resolve(null) : attempt(() => sessionTitle($, configDir), null),
   ])
   const rateLimits: RateLimitGauge[] = (usage?.rateLimits ?? []).map(limit => {
     const resetsAt = limit.resetsAt === undefined ? NaN : Date.parse(limit.resetsAt)
@@ -442,7 +502,18 @@ async function collectInfo($: EngineInterface): Promise<HudInfo> {
     fetchedAt,
     effortSetting: typeof settings['effortLevel'] === 'string' ? settings['effortLevel'] : null,
     caveman,
+    sessionTitle: title,
   }
+}
+
+// Re-reads the session title alone, for the moment a /rename has just written it.
+async function refreshTitle($: EngineInterface): Promise<void> {
+  const configDir = await configDirOf($, await attempt(() => $.env.get('HOME'), undefined))
+  if (configDir === undefined) return
+  const title = await attempt(() => sessionTitle($, configDir), null)
+  const current = await read($, info)
+  if (current === null || current.sessionTitle === title) return
+  await update($, info, value => (value === null ? value : { ...value, sessionTitle: title }))
 }
 
 async function refreshInfo($: EngineInterface): Promise<void> {
@@ -737,9 +808,16 @@ function headerCard(
           <Text dimColor wrap="truncate-end">{hud === null ? '' : cwdLabel(hud)}</Text>
         </Box>
       </Box>
-      {hud?.caveman ? (
-        <Box marginTop={1}>
-          <Text color={ORANGE} wrap="truncate-start">{hud.caveman}</Text>
+      {hud !== null && (hud.sessionTitle !== null || hud.caveman !== null) ? (
+        <Box justifyContent="space-between" marginTop={1} gap={1}>
+          <Box flexShrink={1}>
+            <Text bold wrap="truncate-end">{hud.sessionTitle ?? ''}</Text>
+          </Box>
+          {hud.caveman !== null ? (
+            <Box flexShrink={0}>
+              <Text color={ORANGE}>{hud.caveman}</Text>
+            </Box>
+          ) : null}
         </Box>
       ) : null}
     </Box>
@@ -939,6 +1017,13 @@ export const register: Register = on => {
     await openPane($, true)
 
     return { text: 'HUD pane opened.' }
+  })
+
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    const renamed = await next(e)
+    await refreshTitle($)
+
+    return renamed
   })
 
   on('command.run', { command: 'thoughts' }, async $ => {

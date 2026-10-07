@@ -28,6 +28,7 @@ export type HudInfo = {
   fetchedAt: number
   effortSetting: string | null
   caveman: string | null
+  sessionTitle: string | null
 }
 
 export type AgentStatusLabel = 'running' | 'idle' | 'completed' | 'failed' | 'killed'

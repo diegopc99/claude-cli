@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus } from 'claude-code'
 
-import { groupDrawing, groupSummary, noteGroupRow, parseReply } from '../hooks/register.tsx'
+import { groupDrawing, groupSummary, isTitleFresh, noteGroupRow, parseReply, pickSessionTitle } from '../hooks/register.tsx'
 import type { GroupTracker } from '../hooks/register.tsx'
 
 const PANE = {
@@ -61,6 +61,77 @@ describe('side pane header', () => {
     await clock.advance(5)
     expect(await pane.find({ text: /effort max/ })).toBeDefined()
     expect(await pane.find({ text: /MODE|mode on next prompt/ })).toBeUndefined()
+  })
+})
+
+describe('session title', () => {
+  test('prefers the /rename title, decodes escapes and drops control characters', () => {
+    expect(pickSessionTitle(['"aiTitle":"Fix the HUD"'])).toBe('Fix the HUD')
+    expect(pickSessionTitle(['"aiTitle":"Generated"', '"customTitle":"Mine"', '"aiTitle":"Later generated"'])).toBe('Mine')
+    expect(pickSessionTitle(['"aiTitle":"Sesi\\u00f3n \\"rara\\""'])).toBe('Sesión "rara"')
+    expect(pickSessionTitle(['"aiTitle":"bad\\u001b]0;x\\u0007title"'])).toBe('bad]0;xtitle')
+    expect(pickSessionTitle(['"aiTitle":"cut\\', '"aiTitle":"whole"'])).toBe('whole')
+    expect(pickSessionTitle([])).toBeNull()
+  })
+
+  test('shows the session title to the left of the caveman badge', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, { HOME: '/home/u' })
+    const titles = '"aiTitle":"RFC1123 restriction for cluster names"\n'
+    const mtimeMs = 1
+    on('session.id', () => ({ value: '01234567-89ab-cdef-0123-456789abcdef' }))
+    on('fs.read', ($, e) => (String(e.path).endsWith('.caveman-active') ? { value: 'full' } : { value: '' }))
+    on('fs.stat', () => ({ value: { kind: 'file' as const, size: titles.length, mtimeMs, isLink: false } }))
+    on('process.run', ($, e) => {
+      if (e.argv[0] === 'find') return ran('/home/u/.claude/projects/-p/01234567-89ab-cdef-0123-456789abcdef.jsonl\n')
+      if (e.argv[0] === 'grep') return ran(titles)
+      return ran('')
+    })
+
+    const pane = await $.ui.mount(PANE)
+    await clock.advance(5)
+    expect(await pane.find({ type: 'Text', text: /^RFC1123 restriction for cluster names$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^\[CAVEMAN\]$/ })).toBeDefined()
+
+  })
+
+  test('shows a /rename right away, without waiting for the next refresh', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, { HOME: '/home/u' })
+    let titles = '"aiTitle":"Generated"\n'
+    let mtimeMs = 1
+    on('session.id', () => ({ value: '01234567-89ab-cdef-0123-456789abcdef' }))
+    on('fs.stat', () => ({ value: { kind: 'file' as const, size: titles.length, mtimeMs, isLink: false } }))
+    on('process.run', ($, e) => {
+      if (e.argv[0] === 'find') return ran('/home/u/.claude/projects/-p/01234567-89ab-cdef-0123-456789abcdef.jsonl\n')
+      if (e.argv[0] === 'grep') return ran(titles)
+      return ran('')
+    })
+    on('command.run', ($, e) => {
+      titles += `"customTitle":"${e.args}"\n`
+      mtimeMs = 2
+      return { text: `Session renamed to: ${e.args}` }
+    })
+
+    const pane = await $.ui.mount(PANE)
+    await clock.advance(5)
+    expect(await pane.find({ type: 'Text', text: /^Generated$/ })).toBeDefined()
+
+    await $.command.run({
+      command: 'rename',
+      args: 'renamed',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: true, columns: 120 },
+    })
+    expect(await pane.find({ type: 'Text', text: /^renamed$/ })).toBeDefined()
+  })
+
+  test('re-reads the title as soon as the transcript changes, as a /rename does', () => {
+    const cache = { id: 'a', stamp: '100:1' }
+    expect(isTitleFresh(cache, 'a', '100:1')).toBe(true)
+    expect(isTitleFresh(cache, 'a', '160:2')).toBe(false)
+    expect(isTitleFresh(cache, 'b', '100:1')).toBe(false)
+    expect(isTitleFresh(undefined, 'a', '100:1')).toBe(false)
   })
 })
 
