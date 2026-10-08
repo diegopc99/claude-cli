@@ -43,6 +43,7 @@ const PROMPT_CARD = '#373737'
 // The dark theme's side-panel background (composerSidebarBackground).
 const CODE_CARD = '#262626'
 const SECTION_INDENT = 2
+const PANE_GUTTER = 2
 const PANE = 'hud'
 const PANE_COLUMNS = 46
 const VIEWER_COLUMNS = 96
@@ -1710,14 +1711,25 @@ export const register: Register = on => {
       read($, agentLog),
     ])
     if (hud === null) queueRefresh($)
-    if (shown !== null) return agentViewer($, e, shown, rows.find(row => row.id === shown), log, at)
+    // Every part sizes itself from bodyColumns, so each is drawn for the width
+    // left beside the gutter that keeps text off the pane's right edge.
+    const inner: RenderInput<'Pane'> = {
+      ...e,
+      props: { ...e.props, bodyColumns: Math.max(1, e.props.bodyColumns - PANE_GUTTER) },
+    }
 
     return (
-      <Box flexDirection="column" width={e.props.bodyColumns}>
-        {headerCard($, e, hud, effortLevel)}
-        {sessionSection($, e, hud)}
-        {workspaceSection($, e, hud)}
-        {agentsSection($, e, rows, at, e.props.view.agentId)}
+      <Box width={e.props.bodyColumns} paddingRight={PANE_GUTTER}>
+        {shown !== null ? (
+          agentViewer($, inner, shown, rows.find(row => row.id === shown), log, at)
+        ) : (
+          <Box flexDirection="column" width={inner.props.bodyColumns}>
+            {headerCard($, inner, hud, effortLevel)}
+            {sessionSection($, inner, hud)}
+            {workspaceSection($, inner, hud)}
+            {agentsSection($, inner, rows, at, e.props.view.agentId)}
+          </Box>
+        )}
       </Box>
     )
   })
