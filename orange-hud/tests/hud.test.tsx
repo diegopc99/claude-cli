@@ -231,6 +231,10 @@ describe('side pane sections', () => {
     await clock.advance(1_000)
     expect(await pane.find({ text: /✓/ })).toBeDefined()
     expect(await pane.find({ text: /AGENTS · 1 done/ })).toBeDefined()
+    expect(JSON.stringify(await pane.drawn())).toContain('"backgroundColor":"#373737"')
+
+    await pane.press({ key: 'clear' })
+    expect(await pane.find({ text: /no agents yet/ })).toBeDefined()
   })
 })
 

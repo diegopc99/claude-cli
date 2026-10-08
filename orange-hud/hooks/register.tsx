@@ -854,7 +854,8 @@ function sectionTitle($: EngineInterface, e: SiteInput, title: string, right?: R
 
   // Fixed-width parts sit in non-shrinking boxes: Yoga shrinks every flex item
   // in proportion to its width, so an unguarded title loses its last letter to
-  // the rule beside it and wraps.
+  // the rule beside it and wraps. The rule wraps inside one clipped row, as
+  // truncating it would end it in an ellipsis.
   return (
     <Box gap={1}>
       <Box flexShrink={0}>
@@ -863,8 +864,8 @@ function sectionTitle($: EngineInterface, e: SiteInput, title: string, right?: R
       <Box flexShrink={0}>
         <Text color={ORANGE} bold>{title}</Text>
       </Box>
-      <Box flexGrow={1} flexShrink={1}>
-        <Text color={ORANGE} dimColor wrap="truncate-end">{'─'.repeat(e.props.bodyColumns)}</Text>
+      <Box flexGrow={1} flexShrink={1} height={1} overflow="hidden">
+        <Text color={ORANGE} dimColor wrap="wrap">{'─'.repeat(e.props.bodyColumns)}</Text>
       </Box>
       {right !== undefined ? <Box flexShrink={0}>{right}</Box> : null}
     </Box>
@@ -1046,7 +1047,16 @@ function agentsSection(
   const title = counts.length > 0 ? `AGENTS · ${counts.join(' · ')}` : 'AGENTS'
   const clear =
     done.length > 0 ? (
-      <Button key="clear" label="clear" hotkey="c" plain onPress={() => update($, agents, list => list.filter(isLive))} />
+      <Box key="clear-chip" backgroundColor={PROMPT_CARD} paddingX={1}>
+        <Button
+          key="clear"
+          label="✕ clear"
+          plain
+          dimColor
+          hover={{ dimColor: false, bold: true, inverse: false }}
+          onPress={() => update($, agents, list => list.filter(isLive))}
+        />
+      </Box>
     ) : undefined
 
   return (
@@ -1073,12 +1083,13 @@ function agentsSection(
                   <Box flexShrink={0}>
                     <Text color={statusColor(row.status)}>{statusIcon(row, at)}</Text>
                   </Box>
-                  <Box flexShrink={1}>
+                  <Box key={`agent-name:${row.id}`} flexShrink={1}>
                     <Button
                       key={`agent:${row.id}`}
                       label={clip(row.description || row.type, Math.max(4, room))}
                       plain
                       dimColor={!isRowLive}
+                      hover={{ dimColor: false, bold: true, inverse: false }}
                       onPress={() => showAgent($, row.id)}
                     />
                   </Box>
@@ -1123,7 +1134,16 @@ function agentViewer(
 
   return (
     <Box flexDirection="column" width={e.props.bodyColumns}>
-      <Button key="back" label="← HUD" plain onPress={() => showAgent($, null)} />
+      <Box key="back-link">
+        <Button
+          key="back"
+          label="← HUD"
+          plain
+          dimColor
+          hover={{ dimColor: false, bold: true, inverse: false }}
+          onPress={() => showAgent($, null)}
+        />
+      </Box>
       <Box flexDirection="column" marginTop={1}>
         {sectionTitle($, e, `AGENT${row === undefined ? '' : ` · ${row.type}`}`, time)}
         {row !== undefined ? (
