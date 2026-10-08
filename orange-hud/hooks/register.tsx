@@ -6,10 +6,22 @@ import type {
   Register,
   RenderElement,
   RenderInput,
+  ResolveInput,
+  SessionMessage,
   Timer,
 } from 'claude-code'
 
-import type { AgentRow, AgentStatusLabel, GitState, HudInfo, RateLimitGauge, TurnGroupView } from '../types'
+import type {
+  AgentLogEntry,
+  AgentLogView,
+  AgentRow,
+  AgentStatusLabel,
+  AgentToolOutcome,
+  GitState,
+  HudInfo,
+  RateLimitGauge,
+  TurnGroupView,
+} from '../types'
 
 type SiteInput = RenderInput<'Pane'> | RenderInput<'AbovePrompt'>
 type ClassicSessionFields = { effort?: { level: string }; agent_id?: string }
@@ -30,7 +42,9 @@ const CODE_CARD = '#262626'
 const SECTION_INDENT = 2
 const PANE = 'hud'
 const PANE_COLUMNS = 46
+const VIEWER_COLUMNS = 96
 const MAX_AGENTS = 50
+const MAX_LOG_ENTRIES = 300
 const INFO_MS = 5_000
 const POLL_MS = 1_000
 // A finished subagent leaves $.agent.list() a little after it ends; one that is
@@ -60,8 +74,12 @@ const groupOf = atom({ plugin: 'orange-hud', key: 'groupOf' } as const, null)
 const turnGroup = atom({ plugin: 'orange-hud', key: 'turnGroup' } as const, null)
 const groupOpen = atom({ plugin: 'orange-hud', key: 'groupOpen' } as const, false)
 const showThoughts = atom({ plugin: 'orange-hud', key: 'showThoughts' } as const, false)
+const viewing = atom({ plugin: 'orange-hud', key: 'viewing' } as const, null)
+const agentLog = atom({ plugin: 'orange-hud', key: 'agentLog' } as const, null)
 
 let poller: Timer | undefined
+let isLogLoading = false
+let isLogStale = false
 let paneHinted = false
 let isAutoOpened = false
 let isRefreshQueued = false
@@ -352,6 +370,52 @@ export function printable(text: string): string {
   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
 }
 
+function printableLines(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+}
+
+export function clip(text: string, width: number): string {
+  if (text.length <= width) return text
+  return width <= 1 ? text.slice(0, Math.max(0, width)) : `${text.slice(0, width - 1)}…`
+}
+
+const SUMMARY_KEYS = ['file_path', 'path', 'pattern', 'command', 'url', 'query', 'skill', 'description', 'prompt']
+
+export function toolSummary(input: Record<string, unknown>): string {
+  for (const key of SUMMARY_KEYS) {
+    const value = input[key]
+    if (typeof value === 'string' && value.trim() !== '') return clip(printable(value.replace(/\s+/g, ' ').trim()), 200)
+  }
+  return ''
+}
+
+// An agent's conversation as the viewer draws it: tool results are read off the
+// calls they answer, and injected reminders are not the agent's prompt.
+export function agentLogEntries(messages: readonly SessionMessage[]): AgentLogEntry[] {
+  const entries: AgentLogEntry[] = []
+  for (const message of messages) {
+    if (message.role === 'user') {
+      if ((message.toolResults?.length ?? 0) > 0) continue
+      const text = printableLines(message.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')).trim()
+      if (text !== '') entries.push({ kind: 'prompt', text })
+      continue
+    }
+    const text = printableLines(message.text).trim()
+    if (text !== '') entries.push({ kind: 'reply', text })
+    for (const use of message.toolUses) {
+      const outcome: AgentToolOutcome =
+        use.isError === true ? 'error' : use.text === undefined && use.result === undefined ? 'pending' : 'ok'
+      entries.push({
+        kind: 'tool',
+        name: printable(use.tool).replace(/^mcp__[^_]+__/, ''),
+        summary: toolSummary(use.input),
+        outcome,
+      })
+    }
+  }
+  return entries.slice(-MAX_LOG_ENTRIES)
+}
+
 function cwdLabel(hud: HudInfo): string {
   if (hud.home !== null && hud.cwd === hud.home) return '~'
   return hud.cwd.split('/').filter(part => part !== '').at(-1) ?? hud.cwd
@@ -538,12 +602,54 @@ function noteSession($: EngineInterface, e: ClassicSessionFields): void {
 }
 
 async function openPane($: EngineInterface, isAsked: boolean): Promise<void> {
-  const opened = await $.ui.open({ id: PANE, title: 'HUD', columns: PANE_COLUMNS })
+  const columns = (await read($, viewing)) === null ? PANE_COLUMNS : VIEWER_COLUMNS
+  const opened = await $.ui.open({ id: PANE, title: 'HUD', columns })
   $.ui.invalidate('ui.render')
   if (!opened.isPlaced && !isAsked && !paneHinted) {
     paneHinted = true
     $.ui.toast('HUD: widen the terminal or run /hud to dock it on the right')
   }
+}
+
+async function loadAgentLog($: EngineInterface): Promise<void> {
+  const agentId = await read($, viewing)
+  if (agentId === null) return
+  const found = await attempt(() => $.session.messages({ agentId }), { deny: 'unreadable' })
+  if ((await read($, viewing)) !== agentId) return
+  const current = await read($, agentLog)
+  if (!Array.isArray(found) && current?.agentId === agentId && current.entries.length > 0) return
+  const fresh: AgentLogView = Array.isArray(found)
+    ? { agentId, entries: agentLogEntries(found), isDenied: false }
+    : { agentId, entries: [], isDenied: true }
+  if (JSON.stringify(current) === JSON.stringify(fresh)) return
+  await update($, agentLog, () => fresh)
+}
+
+// A refresh asked for while one runs is folded into one more pass after it, so
+// an agent's last turn is never dropped behind a poll that read it a moment early.
+async function refreshAgentLog($: EngineInterface): Promise<void> {
+  if (isLogLoading) {
+    isLogStale = true
+    return
+  }
+  isLogLoading = true
+  try {
+    do {
+      isLogStale = false
+      await loadAgentLog($)
+    } while (isLogStale)
+  } finally {
+    isLogLoading = false
+  }
+}
+
+async function showAgent($: EngineInterface, agentId: string | null): Promise<void> {
+  await update($, viewing, () => agentId)
+  await update($, agentLog, () => null)
+  await openPane($, true)
+  if (agentId === null) return
+  await refreshAgentLog($)
+  await attempt(() => $.ui.scroll({ to: 'end', in: PANE }), undefined)
 }
 
 async function isHudInPane($: EngineInterface): Promise<boolean> {
@@ -597,6 +703,8 @@ async function pollAgents($: EngineInterface): Promise<void> {
       return isLiveLabel(label) ? { ...row, status: label } : { ...row, status: label, endedAt: at }
     }),
   )
+  const shown = await read($, viewing)
+  if (shown !== null && rows.some(row => row.id === shown && isLive(row))) void refreshAgentLog($)
 }
 
 function ensurePoller($: EngineInterface): void {
@@ -643,7 +751,7 @@ async function drawGrouped(
   )
 }
 
-function replyBlock($: EngineInterface, e: RenderInput<'AssistantMessage'>, block: ReplyBlock): RenderElement {
+function replyBlock($: EngineInterface, e: ResolveInput, block: ReplyBlock): RenderElement {
   const { Box, Code, Markdown, Text } = $.ui.resolve(e)
   const plain = (text: string) => text.replace(/\*\*|__|`/g, '')
 
@@ -711,16 +819,31 @@ function replyBlock($: EngineInterface, e: RenderInput<'AssistantMessage'>, bloc
   }
 }
 
-function replyTree($: EngineInterface, e: RenderInput<'AssistantMessage'>): RenderElement {
+function replyTree($: EngineInterface, e: ResolveInput, text: string, isFirst: boolean): RenderElement {
   const { Box, Text } = $.ui.resolve(e)
 
   return (
     <Box marginTop={1}>
       <Box flexShrink={0} width={3}>
-        <Text color={ORANGE}>{e.props.isFirstOfReply ? '●' : ' '}</Text>
+        <Text color={ORANGE}>{isFirst ? '●' : ' '}</Text>
       </Box>
       <Box flexDirection="column" flexShrink={1} flexGrow={1} gap={1}>
-        {parseReply(e.props.text).map(block => replyBlock($, e, block))}
+        {parseReply(text).map(block => replyBlock($, e, block))}
+      </Box>
+    </Box>
+  )
+}
+
+function promptCard($: EngineInterface, e: ResolveInput, text: string): RenderElement {
+  const { Box, Text } = $.ui.resolve(e)
+
+  return (
+    <Box backgroundColor={PROMPT_CARD} paddingX={2} paddingY={1} marginTop={1} marginBottom={1} gap={2}>
+      <Box flexShrink={0}>
+        <Text color={ORANGE} bold>❯</Text>
+      </Box>
+      <Box flexShrink={1}>
+        <Text color="text" wrap="wrap">{text}</Text>
       </Box>
     </Box>
   )
@@ -896,8 +1019,26 @@ function workspaceSection($: EngineInterface, e: SiteInput, hud: HudInfo | null)
   )
 }
 
-function agentsSection($: EngineInterface, e: SiteInput, rows: readonly AgentRow[], at: number): RenderElement {
+function agentDetails(row: AgentRow): string {
+  return [
+    modelLabel(row.model),
+    `${row.tools} tool${row.tools === 1 ? '' : 's'}`,
+    isLive(row) ? row.lastTool : row.tokens !== null ? `${tokens(row.tokens)} tok` : null,
+    row.isBackground ? 'bg' : null,
+  ]
+    .filter(part => part !== null)
+    .join(' · ')
+}
+
+function agentsSection(
+  $: EngineInterface,
+  e: SiteInput,
+  rows: readonly AgentRow[],
+  at: number,
+  viewed: string | undefined,
+): RenderElement {
   const { Box, Button, Text } = $.ui.resolve(e)
+  const hasViewed = rows.some(row => row.id === viewed)
   const live = rows.filter(isLive).reverse()
   const done = rows.filter(row => !isLive(row)).reverse()
   const counts = [live.length > 0 ? `${live.length} running` : null, done.length > 0 ? `${done.length} done` : null]
@@ -916,22 +1057,30 @@ function agentsSection($: EngineInterface, e: SiteInput, rows: readonly AgentRow
         {[...live, ...done].map(row => {
           const isRowLive = isLive(row)
           const took = elapsed((row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt)
-          const details = [
-            modelLabel(row.model),
-            `${row.tools} tool${row.tools === 1 ? '' : 's'}`,
-            isRowLive ? row.lastTool : row.tokens !== null ? `${tokens(row.tokens)} tok` : null,
-            row.isBackground ? 'bg' : null,
-          ].filter(part => part !== null)
+          // A Button does not truncate its label, so it is cut to the room the
+          // row leaves beside the marker, status, type and time.
+          const room = e.props.bodyColumns - SECTION_INDENT - (hasViewed ? 2 : 0) - 2 - 1 - row.type.length - 1 - 6
 
           return (
             <Box flexDirection="column">
               <Box justifyContent="space-between" gap={1}>
                 <Box gap={1} flexShrink={1}>
+                  {hasViewed ? (
+                    <Box flexShrink={0}>
+                      <Text color={ORANGE} bold>{row.id === viewed ? '▶' : ' '}</Text>
+                    </Box>
+                  ) : null}
                   <Box flexShrink={0}>
                     <Text color={statusColor(row.status)}>{statusIcon(row, at)}</Text>
                   </Box>
                   <Box flexShrink={1}>
-                    <Text bold={isRowLive} dimColor={!isRowLive} wrap="truncate-end">{row.description}</Text>
+                    <Button
+                      key={`agent:${row.id}`}
+                      label={clip(row.description || row.type, Math.max(4, room))}
+                      plain
+                      dimColor={!isRowLive}
+                      onPress={() => showAgent($, row.id)}
+                    />
                   </Box>
                 </Box>
                 <Box gap={1} flexShrink={0}>
@@ -939,11 +1088,84 @@ function agentsSection($: EngineInterface, e: SiteInput, rows: readonly AgentRow
                   <Text color={isRowLive ? ORANGE : 'inactive'}>{took.padStart(6)}</Text>
                 </Box>
               </Box>
-              <Text dimColor wrap="truncate-end">{`  ${details.join(' · ')}`}</Text>
+              <Text dimColor wrap="truncate-end">{`  ${agentDetails(row)}`}</Text>
             </Box>
           )
         })}
       </Box>
+    </Box>
+  )
+}
+
+function outcomeMark(outcome: AgentToolOutcome): { glyph: string; color: Color } {
+  switch (outcome) {
+    case 'ok':
+      return { glyph: '✓', color: 'success' }
+    case 'error':
+      return { glyph: '✗', color: 'error' }
+    default:
+      return { glyph: '◌', color: ORANGE }
+  }
+}
+
+function agentViewer(
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+  agentId: string,
+  row: AgentRow | undefined,
+  log: AgentLogView | null,
+  at: number,
+): RenderElement {
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const entries = log?.agentId === agentId ? log.entries : []
+  const took = row === undefined ? null : elapsed((row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt)
+  const time = took === null ? undefined : <Text color={row !== undefined && isLive(row) ? ORANGE : 'inactive'}>{took}</Text>
+
+  return (
+    <Box flexDirection="column" width={e.props.bodyColumns}>
+      <Button key="back" label="← HUD" plain onPress={() => showAgent($, null)} />
+      <Box flexDirection="column" marginTop={1}>
+        {sectionTitle($, e, `AGENT${row === undefined ? '' : ` · ${row.type}`}`, time)}
+        {row !== undefined ? (
+          <Box flexDirection="column" paddingLeft={SECTION_INDENT} marginTop={1}>
+            <Box gap={1}>
+              <Box flexShrink={0}>
+                <Text color={statusColor(row.status)}>{statusIcon(row, at)}</Text>
+              </Box>
+              <Box flexShrink={1}>
+                <Text bold wrap="truncate-end">{row.description || row.type}</Text>
+              </Box>
+            </Box>
+            <Text dimColor wrap="truncate-end">{`  ${agentDetails(row)}`}</Text>
+          </Box>
+        ) : null}
+      </Box>
+      {log?.isDenied === true ? (
+        <Box marginTop={1}>
+          <Text color="warning" wrap="wrap">No se puede leer el transcript de este agente.</Text>
+        </Box>
+      ) : null}
+      {log !== null && !log.isDenied && entries.length === 0 ? (
+        <Box marginTop={1}>
+          <Text dimColor>sin mensajes todavía</Text>
+        </Box>
+      ) : null}
+      {entries.map(entry => {
+        if (entry.kind === 'prompt') return promptCard($, e, entry.text)
+        if (entry.kind === 'reply') return replyTree($, e, entry.text, true)
+        const mark = outcomeMark(entry.outcome)
+        return (
+          <Box gap={1} paddingLeft={3}>
+            <Box flexShrink={0} gap={1}>
+              <Text color={mark.color}>{mark.glyph}</Text>
+              <Text bold>{entry.name}</Text>
+            </Box>
+            <Box flexShrink={1}>
+              <Text dimColor wrap="truncate-end">{entry.summary}</Text>
+            </Box>
+          </Box>
+        )
+      })}
     </Box>
   )
 }
@@ -1009,6 +1231,7 @@ export const register: Register = on => {
     void refreshInfo($)
     $.clock.every(INFO_MS, () => void refreshInfo($))
     if ((await read($, agents)).some(isLive)) ensurePoller($)
+    if ((await read($, viewing)) !== null) void refreshAgentLog($)
 
     return next(e)
   })
@@ -1046,6 +1269,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     void refreshInfo($)
+    if (e.agentId !== undefined && e.agentId === (await read($, viewing))) void refreshAgentLog($)
     const group = tracker.group
     if (e.agentId === undefined && group !== null && group.isActive) {
       const settled: TurnGroupView = { ...group, isActive: false }
@@ -1112,7 +1336,9 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) =>
     drawGrouped($, e, [e.requestId], async () =>
-      e.props.isSummary === true || e.props.text.trim() === '' || /^API Error/.test(e.props.text) ? next(e) : replyTree($, e),
+      e.props.isSummary === true || e.props.text.trim() === '' || /^API Error/.test(e.props.text)
+        ? next(e)
+        : replyTree($, e, e.props.text, e.props.isFirstOfReply),
     ),
   )
 
@@ -1131,20 +1357,9 @@ export const register: Register = on => {
     ),
   )
 
-  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'composer' } } }, ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-
-    return (
-      <Box backgroundColor={PROMPT_CARD} paddingX={2} paddingY={1} marginTop={1} marginBottom={1} gap={2}>
-        <Box flexShrink={0}>
-          <Text color={ORANGE} bold>❯</Text>
-        </Box>
-        <Box flexShrink={1}>
-          <Text color="text" wrap="wrap">{e.props.text}</Text>
-        </Box>
-      </Box>
-    )
-  })
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'composer' } } }, ($, e) =>
+    promptCard($, e, e.props.text),
+  )
 
   on('agent.spawn', async ($, e, next) => {
     const spawned = await next(e)
@@ -1240,20 +1455,23 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box } = $.ui.resolve(e)
-    const [hud, rows, at, effortLevel] = await Promise.all([
+    const [hud, rows, at, effortLevel, shown, log] = await Promise.all([
       read($, info),
       read($, agents),
       read($, now),
       read($, effort),
+      read($, viewing),
+      read($, agentLog),
     ])
     if (hud === null) queueRefresh($)
+    if (shown !== null) return agentViewer($, e, shown, rows.find(row => row.id === shown), log, at)
 
     return (
       <Box flexDirection="column" width={e.props.bodyColumns}>
         {headerCard($, e, hud, effortLevel)}
         {sessionSection($, e, hud)}
         {workspaceSection($, e, hud)}
-        {agentsSection($, e, rows, at)}
+        {agentsSection($, e, rows, at, e.props.view.agentId)}
       </Box>
     )
   })

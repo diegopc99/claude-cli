@@ -1,7 +1,15 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus } from 'claude-code'
 
-import { groupDrawing, groupSummary, isTitleFresh, noteGroupRow, parseReply, pickSessionTitle } from '../hooks/register.tsx'
+import {
+  agentLogEntries,
+  groupDrawing,
+  groupSummary,
+  isTitleFresh,
+  noteGroupRow,
+  parseReply,
+  pickSessionTitle,
+} from '../hooks/register.tsx'
 import type { GroupTracker } from '../hooks/register.tsx'
 
 const PANE = {
@@ -223,6 +231,113 @@ describe('side pane sections', () => {
     await clock.advance(1_000)
     expect(await pane.find({ text: /✓/ })).toBeDefined()
     expect(await pane.find({ text: /AGENTS · 1 done/ })).toBeDefined()
+  })
+})
+
+describe('agent viewer', () => {
+  const SPAWN = {
+    tool_use_id: 'toolu_1',
+    prompt: 'find callers',
+    description: 'Find callers',
+    subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' as const },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork: false,
+  }
+
+  const MESSAGES = [
+    { role: 'user' as const, text: '<system-reminder>ctx</system-reminder>\nFind every caller of openPane', toolUses: [] },
+    {
+      role: 'assistant' as const,
+      text: 'Buscando.',
+      toolUses: [
+        { tool_use_id: 't1', tool: 'Grep', input: { pattern: 'openPane\\(' }, text: '3 matches' },
+        { tool_use_id: 't2', tool: 'mcp__srv__lookup', input: { query: 'x' }, text: 'boom', isError: true as const },
+        { tool_use_id: 't3', tool: 'Read', input: { file_path: '/repo/hooks/register.tsx' } },
+      ],
+    },
+    {
+      role: 'user' as const,
+      text: '',
+      toolUses: [],
+      toolResults: [{ tool_use_id: 't1', text: '3 matches', isError: false, result: undefined }],
+    },
+    { role: 'assistant' as const, text: '## Callers\n- register.tsx', toolUses: [] },
+  ]
+
+  test('turns an agent conversation into prompt, reply and one line per tool', () => {
+    expect(agentLogEntries(MESSAGES)).toEqual([
+      { kind: 'prompt', text: 'Find every caller of openPane' },
+      { kind: 'reply', text: 'Buscando.' },
+      { kind: 'tool', name: 'Grep', summary: 'openPane\\(', outcome: 'ok' },
+      { kind: 'tool', name: 'lookup', summary: 'x', outcome: 'error' },
+      { kind: 'tool', name: 'Read', summary: '/repo/hooks/register.tsx', outcome: 'pending' },
+      { kind: 'reply', text: '## Callers\n- register.tsx' },
+    ])
+  })
+
+  test('a click on an agent shows its conversation in the pane, and ← HUD returns', async ($, on) => {
+    mock.clock(on, { now: 10_000 })
+    const opens: Array<number | undefined> = []
+    const asked: Array<string | undefined> = []
+    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'agent-1' }))
+    on('agent.list', () => ({ value: [{ id: 'agent-1', description: 'Find callers', type: 'Explore', status: 'running' as AgentStatus }] }))
+    on('ui.open', ($, e) => {
+      opens.push(e.columns)
+      return { value: { isPlaced: true as const } }
+    })
+    on('ui.scroll', () => ({}))
+    on('session.messages', ($, e) => {
+      asked.push(e.agentId)
+      return { value: MESSAGES }
+    })
+
+    await $.agent.spawn(SPAWN)
+    const pane = await $.ui.mount(PANE)
+    await pane.press({ key: 'agent:agent-1' })
+
+    expect(asked).toContain('agent-1')
+    expect(opens.at(-1)).toBe(96)
+    expect(await pane.find({ text: /AGENT · Explore/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Find every caller of openPane' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^◆ Callers$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'lookup' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✗' })).toBeDefined()
+    expect(await pane.find({ text: /SESSION/ })).toBeUndefined()
+
+    await pane.press({ key: 'back' })
+    expect(opens.at(-1)).toBe(46)
+    expect(await pane.find({ text: /SESSION/ })).toBeDefined()
+    expect(await pane.find({ text: /AGENTS · 1 running/ })).toBeDefined()
+  })
+
+  test('says so when the agent conversation cannot be read', async ($, on) => {
+    mock.clock(on, { now: 10_000 })
+    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'agent-1' }))
+    on('agent.list', () => ({ value: [] }))
+    on('ui.open', () => ({ value: { isPlaced: true as const } }))
+    on('session.messages', () => ({ value: { deny: 'agent-1: no transcript' } }))
+
+    await $.agent.spawn(SPAWN)
+    const pane = await $.ui.mount(PANE)
+    await pane.press({ key: 'agent:agent-1' })
+    expect(await pane.find({ text: /No se puede leer/ })).toBeDefined()
+  })
+
+  test('marks the agent whose transcript the person has in view', async ($, on) => {
+    mock.clock(on, { now: 10_000 })
+    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'agent-1' }))
+    on('agent.list', () => ({ value: [] }))
+    on('ui.open', () => ({ value: { isPlaced: true as const } }))
+
+    await $.agent.spawn(SPAWN)
+    const main = await $.ui.mount(PANE)
+    expect(await main.find({ type: 'Text', text: '▶' })).toBeUndefined()
+    await main.unmount()
+
+    const viewed = await $.ui.mount({ ...PANE, props: { ...PANE.props, view: { agentId: 'agent-1' } } })
+    expect(await viewed.find({ type: 'Text', text: '▶' })).toBeDefined()
   })
 })
 

@@ -48,6 +48,19 @@ export type AgentRow = {
   tokens: number | null
 }
 
+export type AgentToolOutcome = 'pending' | 'ok' | 'error'
+
+export type AgentLogEntry =
+  | { kind: 'prompt'; text: string }
+  | { kind: 'reply'; text: string }
+  | { kind: 'tool'; name: string; summary: string; outcome: AgentToolOutcome }
+
+export type AgentLogView = {
+  agentId: string
+  entries: AgentLogEntry[]
+  isDenied: boolean
+}
+
 export type TurnGroupView = {
   head: string
   texts: number
@@ -68,6 +81,8 @@ declare module 'claude-code' {
       turnGroup: StateFamily<TurnGroupView | null>
       groupOpen: StateFamily<boolean>
       showThoughts: boolean
+      viewing: string | null
+      agentLog: AgentLogView | null
     }
   }
 }
