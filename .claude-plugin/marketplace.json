@@ -9,7 +9,7 @@
       "name": "orange-hud",
       "source": "./orange-hud",
       "description": "Orange HUD for Claude Code: a side pane with session, workspace and agent status, turn work folded into one line, and restyled prompts and replies",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ],
   "description": "Claude Code terminal mods by diegopc99"
