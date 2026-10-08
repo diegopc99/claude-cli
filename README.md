@@ -6,7 +6,7 @@ Terminal mods for [Claude Code](https://code.claude.com), packaged as a plugin m
 
 An orange heads-up display for the Claude Code terminal.
 
-- **Side pane** (docked right in the fullscreen layout): Claude Code version, model, effort, the session's title, context and rate-limit gauges, cost, prompts and session time, working directory, git branch with changes and upstream drift, current kube context, and every subagent with its status, tools and timing. Click a subagent to read its conversation in the pane; `← HUD` goes back. The agent whose transcript Claude Code has in view is marked `▶`.
+- **Side pane** (docked right in the fullscreen layout): Claude Code version, model, effort, the session's title, context and rate-limit gauges, cost, prompts and session time, git branch with upstream drift, staged, modified and new files, stashes, the last commit and any rebase, merge or conflict in progress, the current kube context and namespace, and every subagent with its status, tools and timing. Click a subagent to read its conversation in the pane; `← HUD` goes back. The agent whose transcript Claude Code has in view is marked `▶`.
 - **Turn folding**: the intermediate text and tool calls of each turn collapse into one line under your prompt until the final answer or a question. Click the line to expand it, or run `/thoughts` to expand or fold every turn.
 - **Restyled transcript**: your prompts as grey cards, and replies with orange headings, bullets and numbering, code in highlighted cards, and dimmed quotes.
 
@@ -35,7 +35,7 @@ Answer `y` to add the marketplace, then pick the user scope. The mod is active r
 - It does not remove a configured `statusLine`; that keeps drawing under the prompt.
 - The agent viewer is drawn by the mod beside the main transcript: plugins cannot switch Claude Code's own transcript view, which only the tasks list does.
 - The side pane stays open: its × is drawn by Claude Code and cannot be hidden, so the mod ignores it.
-- Every 5 seconds it runs `git --no-optional-locks -c core.fsmonitor=false status` and `kubectl config current-context` in the session's directory. Both are optional: without git or kubectl those rows are simply not shown.
+- Every 5 seconds it runs `git --no-optional-locks -c core.fsmonitor=false status --porcelain=v2` and `kubectl config view --minify` in the session's directory; `git rev-parse` runs once per directory and `git log -1` only when HEAD moves. Both tools are optional: without git or kubectl those rows are simply not shown.
 - No network access. Text from outside the session (kube contexts, branch names, agent descriptions) is stripped of control characters before it is drawn.
 
 ### Uninstall

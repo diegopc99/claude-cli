@@ -1,8 +1,34 @@
+export type GitOperation = 'rebase' | 'merge' | 'cherry-pick' | 'revert' | 'bisect'
+
+export type GitCommit = {
+  hash: string
+  subject: string
+  at: number
+}
+
 export type GitState = {
   branch: string
-  changed: number
+  isDetached: boolean
+  oid: string | null
+  upstream: string | null
   ahead: number | null
   behind: number | null
+  staged: number
+  modified: number
+  untracked: number
+  conflicts: number
+  stashes: number
+  operation: GitOperation | null
+  step: string | null
+  lastCommit: GitCommit | null
+  repo: string
+  subdir: string | null
+  isWorktree: boolean
+}
+
+export type KubeState = {
+  context: string
+  namespace: string | null
 }
 
 export type RateLimitGauge = {
@@ -17,7 +43,7 @@ export type HudInfo = {
   cwd: string
   home: string | null
   git: GitState | null
-  kubeContext: string | null
+  kube: KubeState | null
   contextPercent: number | null
   contextTokens: number | null
   contextWindow: number

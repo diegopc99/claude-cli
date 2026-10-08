@@ -17,8 +17,11 @@ import type {
   AgentRow,
   AgentStatusLabel,
   AgentToolOutcome,
+  GitCommit,
+  GitOperation,
   GitState,
   HudInfo,
+  KubeState,
   RateLimitGauge,
   TurnGroupView,
 } from '../types'
@@ -132,17 +135,80 @@ export function span(ms: number): string {
   return `${Math.floor(hours / 24)}d ${hours % 24}h`
 }
 
-export function parseGitHead(line: string): Omit<GitState, 'changed'> {
-  const body = line.replace(/^## /, '')
-  const hasUpstream = body.includes('...')
-  const name = (body.replace(/ \[[^\]]*\]$/, '').split('...')[0] ?? body).replace(/^No commits yet on /, '')
-  const ahead = /ahead (\d+)/.exec(body)?.[1]
-  const behind = /behind (\d+)/.exec(body)?.[1]
-  return {
-    branch: name === 'HEAD (no branch)' ? 'detached' : name,
-    ahead: hasUpstream ? Number(ahead ?? 0) : null,
-    behind: hasUpstream ? Number(behind ?? 0) : null,
+export function ago(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / 60_000))
+  if (minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  return hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
+}
+
+export type GitStatus = Pick<
+  GitState,
+  'branch' | 'isDetached' | 'oid' | 'upstream' | 'ahead' | 'behind' | 'staged' | 'modified' | 'untracked' | 'conflicts' | 'stashes'
+>
+
+// Reads `git status --porcelain=v2 --branch --show-stash`: headers, then one
+// line per path whose XY pair is the index's state and the work tree's.
+export function parseGitStatus(stdout: string): GitStatus {
+  const status: GitStatus = {
+    branch: '',
+    isDetached: false,
+    oid: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
+    staged: 0,
+    modified: 0,
+    untracked: 0,
+    conflicts: 0,
+    stashes: 0,
   }
+  for (const line of stdout.split('\n')) {
+    const [kind = '', field = '', ...rest] = line.split(' ')
+    if (kind === '#') {
+      const value = printable(rest.join(' '))
+      if (field === 'branch.oid') status.oid = value === '(initial)' ? null : value
+      if (field === 'branch.head') {
+        status.isDetached = value === '(detached)'
+        status.branch = status.isDetached ? 'detached' : value
+      }
+      if (field === 'branch.upstream') status.upstream = value
+      if (field === 'branch.ab') {
+        status.ahead = Math.abs(Number(rest[0] ?? 0))
+        status.behind = Math.abs(Number(rest[1] ?? 0))
+      }
+      if (field === 'stash') status.stashes = Number(rest[0] ?? 0)
+    } else if (kind === '1' || kind === '2') {
+      if (field[0] !== '.') status.staged++
+      if (field[1] !== '.') status.modified++
+    } else if (kind === 'u') {
+      status.conflicts++
+    } else if (kind === '?') {
+      status.untracked++
+    }
+  }
+  return status
+}
+
+const OPERATION_MARKERS: ReadonlyArray<[string, GitOperation]> = [
+  ['rebase-merge', 'rebase'],
+  ['rebase-apply', 'rebase'],
+  ['MERGE_HEAD', 'merge'],
+  ['CHERRY_PICK_HEAD', 'cherry-pick'],
+  ['REVERT_HEAD', 'revert'],
+  ['BISECT_LOG', 'bisect'],
+]
+
+export function gitOperation(names: readonly string[]): GitOperation | null {
+  const present = new Set(names)
+  return OPERATION_MARKERS.find(([marker]) => present.has(marker))?.[1] ?? null
+}
+
+export function parseKube(stdout: string): KubeState | null {
+  const [context = '', namespace = ''] = stdout.trim().split('\t')
+  const name = printable(context)
+  return name === '' ? null : { context: name, namespace: printable(namespace) || null }
 }
 
 function bar(percent: number, width: number): string {
@@ -434,21 +500,75 @@ async function storeEffort($: EngineInterface, value: string): Promise<void> {
   await update($, effort, () => value)
 }
 
-async function gitState($: EngineInterface): Promise<GitState | null> {
-  // No optional locks: a background poll must not take the index lock from the
-  // person's own git commands. No fsmonitor: a repo's config cannot name a command.
+// No optional locks: a background poll must not take the index lock from the
+// person's own git commands. No fsmonitor: a repo's config cannot name a command.
+const GIT = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false'] as const
+
+let repoCache: { cwd: string; root: string; gitDir: string; isWorktree: boolean } | undefined
+let commitCache: { oid: string; commit: GitCommit | null } | undefined
+
+async function gitRepo($: EngineInterface, cwd: string): Promise<typeof repoCache> {
+  if (repoCache?.cwd === cwd) return repoCache
   const run = await $.process.run(
-    ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '--branch'],
+    [...GIT, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'],
     { timeoutMs: 2_000 },
   )
-  if (run.exitCode !== 0) return null
-  const [head = '', ...files] = run.stdout.split('\n').filter(line => line !== '')
-  return { ...parseGitHead(printable(head)), changed: files.length }
+  if (run.exitCode !== 0) return undefined
+  const [root = '', gitDir = '', commonDir = ''] = run.stdout.split('\n')
+  repoCache = { cwd, root, gitDir, isWorktree: gitDir !== commonDir }
+  return repoCache
 }
 
-async function kubeContext($: EngineInterface): Promise<string | null> {
-  const run = await $.process.run(['kubectl', 'config', 'current-context'], { timeoutMs: 2_000 })
-  return run.exitCode === 0 ? printable(run.stdout.trim()) || null : null
+async function lastCommit($: EngineInterface, oid: string | null): Promise<GitCommit | null> {
+  if (oid === null) return null
+  if (commitCache?.oid === oid) return commitCache.commit
+  const run = await $.process.run([...GIT, 'log', '-1', '--format=%h%x1f%ct%x1f%s'], { timeoutMs: 2_000 })
+  const [hash = '', at = '', subject = ''] = run.exitCode === 0 ? run.stdout.trim().split('\x1f') : []
+  const commit = hash === '' ? null : { hash: printable(hash), subject: printable(subject), at: Number(at) * 1_000 }
+  commitCache = { oid, commit }
+  return commit
+}
+
+// A rebase, merge or pick in progress leaves its marker in the git dir, so a
+// listing tells without a process; a rebase's step is two numbers beside it.
+async function gitProgress($: EngineInterface, gitDir: string): Promise<Pick<GitState, 'operation' | 'step'>> {
+  const names = (await attempt(() => $.fs.list(gitDir), [])).map(entry => entry.name)
+  const operation = gitOperation(names)
+  if (operation !== 'rebase') return { operation, step: null }
+  const isMerge = names.includes('rebase-merge')
+  const dir = `${gitDir}/${isMerge ? 'rebase-merge' : 'rebase-apply'}`
+  const read = (name: string) => attempt(async () => (await $.fs.read(`${dir}/${name}`)).trim(), '')
+  const [done, total] = await Promise.all([read(isMerge ? 'msgnum' : 'next'), read(isMerge ? 'end' : 'last')])
+  return { operation, step: /^\d+$/.test(done) && /^\d+$/.test(total) ? `${done}/${total}` : null }
+}
+
+async function gitState($: EngineInterface): Promise<GitState | null> {
+  const run = await $.process.run([...GIT, 'status', '--porcelain=v2', '--branch', '--show-stash'], { timeoutMs: 2_000 })
+  if (run.exitCode !== 0) return null
+  const status = parseGitStatus(run.stdout)
+  const cwd = await $.session.cwd()
+  const repo = await gitRepo($, cwd)
+  const [progress, commit] = await Promise.all([
+    repo === undefined ? { operation: null, step: null } : gitProgress($, repo.gitDir),
+    lastCommit($, status.oid),
+  ])
+  const root = repo?.root ?? cwd
+  return {
+    ...status,
+    ...progress,
+    lastCommit: commit,
+    repo: printable(root.split('/').filter(part => part !== '').at(-1) ?? root),
+    subdir: repo !== undefined && cwd.startsWith(`${root}/`) ? printable(cwd.slice(root.length + 1)) : null,
+    isWorktree: repo?.isWorktree ?? false,
+  }
+}
+
+async function kubeState($: EngineInterface): Promise<KubeState | null> {
+  const run = await $.process.run(
+    ['kubectl', 'config', 'view', '--minify', '-o', 'jsonpath={.current-context}{"\\t"}{..namespace}'],
+    { timeoutMs: 2_000 },
+  )
+  return run.exitCode === 0 ? parseKube(run.stdout) : null
 }
 
 const TITLE_PATTERN = '"(customTitle|aiTitle)":"([^"\\\\]|\\\\.)*"'
@@ -534,7 +654,7 @@ async function collectInfo($: EngineInterface): Promise<HudInfo> {
     attempt(() => $.session.cwd(), ''),
     attempt(() => $.session.usage(), undefined),
     attempt(() => gitState($), null),
-    attempt(() => kubeContext($), null),
+    attempt(() => kubeState($), null),
     attempt(() => $.session.turns(), null),
     attempt(() => $.settings.read(), {}),
     configDir === undefined ? Promise.resolve(null) : attempt(() => cavemanBadge($, configDir), null),
@@ -555,7 +675,7 @@ async function collectInfo($: EngineInterface): Promise<HudInfo> {
     cwd,
     home: home ?? null,
     git,
-    kubeContext: kube,
+    kube,
     contextPercent: usage?.context.percent ?? null,
     contextTokens: usage?.context.tokens ?? null,
     contextWindow: usage?.context.window ?? 0,
@@ -973,48 +1093,154 @@ function sessionSection($: EngineInterface, e: SiteInput, hud: HudInfo | null): 
   )
 }
 
+function workspaceRow(
+  $: EngineInterface,
+  e: SiteInput,
+  icon: RenderElement,
+  body: RenderElement,
+  right?: RenderElement,
+): RenderElement {
+  const { Box } = $.ui.resolve(e)
+
+  return (
+    <Box gap={1}>
+      <Box flexShrink={0}>{icon}</Box>
+      <Box flexGrow={1} flexShrink={1}>{body}</Box>
+      {right !== undefined ? <Box flexShrink={0}>{right}</Box> : null}
+    </Box>
+  )
+}
+
+function syncMark($: EngineInterface, e: SiteInput, git: GitState): RenderElement {
+  const { Box, Text } = $.ui.resolve(e)
+  if (git.upstream === null) return <Text dimColor>local</Text>
+  if (git.ahead === null || git.behind === null) return <Text color="warning">upstream gone</Text>
+  if (git.ahead === 0 && git.behind === 0) return <Text dimColor>✓ synced</Text>
+
+  return (
+    <Box gap={1}>
+      {git.ahead > 0 ? <Text dimColor>{`↑${git.ahead}`}</Text> : null}
+      {git.behind > 0 ? <Text dimColor>{`↓${git.behind}`}</Text> : null}
+      <Text dimColor>{git.upstream.split('/')[0] ?? git.upstream}</Text>
+    </Box>
+  )
+}
+
+function gitRows($: EngineInterface, e: SiteInput, git: GitState, fetchedAt: number): RenderElement[] {
+  const { Box, Text } = $.ui.resolve(e)
+  const rows: RenderElement[] = []
+  const stash = git.stashes > 0 ? <Text dimColor>{`≡ ${git.stashes} stash${git.stashes === 1 ? '' : 'es'}`}</Text> : undefined
+
+  if (git.operation !== null || git.conflicts > 0) {
+    rows.push(
+      workspaceRow(
+        $,
+        e,
+        <Text color="warning" bold>⚠</Text>,
+        <Box gap={1}>
+          {git.operation !== null ? (
+            <Text color="warning" bold>{`${git.operation.toUpperCase()}${git.step === null ? '' : ` ${git.step}`}`}</Text>
+          ) : null}
+          {git.conflicts > 0 ? (
+            <Text color="error" bold>{`${git.conflicts} conflict${git.conflicts === 1 ? '' : 's'}`}</Text>
+          ) : null}
+        </Box>,
+      ),
+    )
+  }
+  if (git.subdir !== null || git.isWorktree) {
+    rows.push(
+      workspaceRow(
+        $,
+        e,
+        <Text color={ORANGE}>⌂</Text>,
+        <Text dimColor wrap="truncate-end">{git.subdir === null ? git.repo : `${git.repo} › ${git.subdir}`}</Text>,
+        git.isWorktree ? <Text dimColor>⧉ worktree</Text> : undefined,
+      ),
+    )
+  }
+  rows.push(
+    workspaceRow(
+      $,
+      e,
+      <Text color={ORANGE}>⎇</Text>,
+      git.isDetached ? (
+        <Text dimColor bold wrap="truncate-end">{`detached @ ${git.oid?.slice(0, 7) ?? '—'}`}</Text>
+      ) : (
+        <Text dimColor bold wrap="truncate-end">{git.branch}</Text>
+      ),
+      syncMark($, e, git),
+    ),
+  )
+  const isClean = git.staged + git.modified + git.untracked + git.conflicts === 0
+  rows.push(
+    isClean
+      ? workspaceRow($, e, <Text color={ORANGE}>✓</Text>, <Text dimColor>clean</Text>, stash)
+      : workspaceRow(
+          $,
+          e,
+          <Text color={ORANGE}>±</Text>,
+          <Box gap={2}>
+            {git.staged > 0 ? <Text dimColor>{`✚ ${git.staged} staged`}</Text> : null}
+            {git.modified > 0 ? <Text dimColor>{`● ${git.modified} modified`}</Text> : null}
+            {git.untracked > 0 ? <Text dimColor>{`? ${git.untracked} new`}</Text> : null}
+          </Box>,
+          stash,
+        ),
+  )
+  if (git.lastCommit !== null) {
+    rows.push(
+      workspaceRow(
+        $,
+        e,
+        <Text color={ORANGE}>◷</Text>,
+        <Box gap={1}>
+          <Box flexShrink={0}>
+            <Text dimColor>{git.lastCommit.hash}</Text>
+          </Box>
+          <Box flexShrink={1}>
+            <Text dimColor wrap="truncate-end">{git.lastCommit.subject}</Text>
+          </Box>
+        </Box>,
+        <Text dimColor>{ago(fetchedAt - git.lastCommit.at)}</Text>,
+      ),
+    )
+  }
+
+  return rows
+}
+
 function workspaceSection($: EngineInterface, e: SiteInput, hud: HudInfo | null): RenderElement {
   const { Box, Text } = $.ui.resolve(e)
   const git = hud?.git ?? null
-  const kube = hud?.kubeContext ?? null
-  const kubeColor: Color = kube !== null && kube.startsWith('kind-') ? 'success' : 'error'
+  const kube = hud?.kube ?? null
 
   return (
     <Box flexDirection="column" marginTop={1} gap={1}>
       {sectionTitle($, e, 'WORKSPACE')}
       <Box flexDirection="column" gap={1} paddingLeft={SECTION_INDENT}>
-        <Box gap={1}>
-          <Box flexShrink={0}>
-            <Text color={ORANGE}>⌂</Text>
-          </Box>
-          <Box flexShrink={1}>
-            <Text dimColor wrap="truncate-end">{hud === null ? '—' : cwdLabel(hud)}</Text>
-          </Box>
-        </Box>
-        {git !== null ? (
-          <Box gap={1}>
-            <Box flexShrink={0}>
-              <Text color={ORANGE}>⎇</Text>
-            </Box>
-            <Box flexShrink={1}>
-              <Text bold wrap="truncate-end">{git.branch}</Text>
-            </Box>
-            <Box flexShrink={0} gap={1}>
-              {git.changed > 0 ? <Text color="warning">●{git.changed} changed</Text> : <Text color="success">✓ clean</Text>}
-              {git.ahead !== null ? <Text dimColor>↑{git.ahead} ↓{git.behind ?? 0}</Text> : null}
-            </Box>
-          </Box>
-        ) : null}
-        {kube !== null ? (
-          <Box gap={1}>
-            <Box flexShrink={0}>
-              <Text color={KUBE_BLUE} bold>⎈</Text>
-            </Box>
-            <Box flexShrink={1}>
-              <Text color={kubeColor} wrap="truncate-end">{kube}</Text>
-            </Box>
-          </Box>
-        ) : null}
+        {hud === null ? <Text dimColor>—</Text> : null}
+        {git !== null && hud !== null ? gitRows($, e, git, hud.fetchedAt) : null}
+        {kube !== null
+          ? workspaceRow(
+              $,
+              e,
+              <Text color={KUBE_BLUE} bold>⎈</Text>,
+              <Box gap={1}>
+                <Box flexShrink={1}>
+                  {kube.context.startsWith('kind-') ? (
+                    <Text dimColor wrap="truncate-end">{kube.context}</Text>
+                  ) : (
+                    <Text color="error" wrap="truncate-end">{kube.context}</Text>
+                  )}
+                </Box>
+                <Box flexShrink={0} gap={1}>
+                  <Text dimColor>·</Text>
+                  <Text dimColor>{kube.namespace ?? 'default'}</Text>
+                </Box>
+              </Box>,
+            )
+          : null}
       </Box>
     </Box>
   )

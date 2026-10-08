@@ -3,10 +3,13 @@ import type { AgentStatus } from 'claude-code'
 
 import {
   agentLogEntries,
+  gitOperation,
   groupDrawing,
   groupSummary,
   isTitleFresh,
   noteGroupRow,
+  parseGitStatus,
+  parseKube,
   parseReply,
   pickSessionTitle,
 } from '../hooks/register.tsx'
@@ -57,7 +60,7 @@ describe('side pane header', () => {
     expect(await pane.find({ text: /v2\.1\.292/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /^Opus 5\.5 · 1M$/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /^effort xhigh$/ })).toBeDefined()
-    expect(await pane.findAll({ type: 'Text', text: /^example-service$/ })).toHaveLength(2)
+    expect(await pane.findAll({ type: 'Text', text: /^example-service$/ })).toHaveLength(1)
     expect(await pane.find({ text: /projects/ })).toBeUndefined()
   })
 
@@ -169,26 +172,117 @@ describe('side pane sections', () => {
     expect(await pane.find({ text: /\$3\.42 · 12 prompts · 1h 05m/ })).toBeDefined()
   })
 
-  test('shows the branch, its changes and upstream drift, and the kube context', async ($, on) => {
-    const clock = mock.clock(on)
+  const STATUS = [
+    '# branch.oid 8ee192ace3a9154c4e7c8de0605ee6b7c92b6a24',
+    '# branch.head feat/agent-viewer',
+    '# branch.upstream origin/feat/agent-viewer',
+    '# branch.ab +2 -1',
+    '# stash 1',
+    '1 M. N... 100644 100644 100644 aaa bbb hooks/register.tsx',
+    '1 .M N... 100644 100644 100644 aaa bbb README.md',
+    '1 MM N... 100644 100644 100644 aaa bbb types/index.d.ts',
+    '2 R. N... 100644 100644 100644 aaa bbb R100 new.ts\told.ts',
+    '? notes.md',
+    '',
+  ].join('\n')
+
+  type Run = { argv: readonly string[] }
+  const workspace = (status: string, kube = 'kind-tilt\tdev\n') => ($: unknown, e: Run) => {
+    const [cmd, ...rest] = e.argv
+    if (cmd === 'kubectl') return ran(kube)
+    if (rest.includes('status')) return ran(status)
+    if (rest.includes('rev-parse')) return ran('/home/u/repo\n/home/u/repo/.git\n/home/u/repo/.git\n')
+    if (rest.includes('log')) return ran('8ee192a\x1f1000\x1fpolish the HUD\'s buttons\n')
+    return ran('')
+  }
+
+  test('reads staged, modified, new, stash and drift apart from porcelain v2', () => {
+    expect(parseGitStatus(STATUS)).toEqual({
+      branch: 'feat/agent-viewer',
+      isDetached: false,
+      oid: '8ee192ace3a9154c4e7c8de0605ee6b7c92b6a24',
+      upstream: 'origin/feat/agent-viewer',
+      ahead: 2,
+      behind: 1,
+      staged: 3,
+      modified: 2,
+      untracked: 1,
+      conflicts: 0,
+      stashes: 1,
+    })
+    const detached = parseGitStatus('# branch.oid (initial)\n# branch.head (detached)\nu UU N... 1 1 1 1 a b c x.go\n')
+    expect(detached).toMatchObject({ branch: 'detached', isDetached: true, oid: null, upstream: null, ahead: null, conflicts: 1 })
+    expect(gitOperation(['HEAD', 'rebase-merge', 'index'])).toBe('rebase')
+    expect(gitOperation(['HEAD', 'MERGE_HEAD'])).toBe('merge')
+    expect(gitOperation(['HEAD', 'index'])).toBeNull()
+    expect(parseKube('kind-tilt\tdev\n')).toEqual({ context: 'kind-tilt', namespace: 'dev' })
+    expect(parseKube('prod-eu\t\n')).toEqual({ context: 'prod-eu', namespace: null })
+    expect(parseKube('')).toBeNull()
+  })
+
+  test('shows the branch with its drift, the changes by kind, the last commit and the kube namespace', async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 + 2 * 3_600_000 })
     const gitArgs: string[][] = []
+    on('session.cwd', () => ({ value: '/home/u/repo/hooks' }))
     on('process.run', ($, e) => {
-      if (e.argv[0] !== 'git') return ran('kind-tilt\n')
-      gitArgs.push([...e.argv])
-      return ran('## main...origin/main [ahead 2]\n M hooks/register.tsx\n?? notes.md\n')
+      if (e.argv[0] === 'git') gitArgs.push([...e.argv])
+      return workspace(STATUS)($, e)
     })
 
     const pane = await $.ui.mount(PANE)
     await clock.advance(5)
     expect(await pane.find({ text: /WORKSPACE/ })).toBeDefined()
-    expect(await pane.find({ text: 'main' })).toBeDefined()
-    expect(await pane.find({ text: /●2 changed/ })).toBeDefined()
-    expect(await pane.find({ text: /↑2 ↓0/ })).toBeDefined()
-    const context = await pane.find({ type: 'Text', text: /^kind-tilt$/ })
-    expect(context?.props['color']).toBe('success')
+    expect(await pane.find({ type: 'Text', text: 'repo › hooks' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'feat/agent-viewer' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '↑2' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '↓1' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'origin' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✚ 3 staged' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '● 2 modified' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '? 1 new' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '≡ 1 stash' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: "polish the HUD's buttons" })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '2h' })).toBeDefined()
+    const context = await pane.find({ type: 'Text', text: 'kind-tilt' })
+    expect(context?.props['dimColor']).toBe(true)
+    expect(context?.props['color']).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: 'dev' })).toBeDefined()
     expect((await pane.find({ type: 'Text', text: /^⎈$/ }))?.props['color']).toBe('#326CE5')
     expect(await pane.findAll({ type: 'Text', text: /^──$/ })).toHaveLength(3)
-    expect(gitArgs[0]).toEqual(['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '--branch'])
+    expect(gitArgs[0]).toEqual(['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=v2', '--branch', '--show-stash'])
+    expect(gitArgs.every(argv => argv.slice(0, 4).join(' ') === 'git --no-optional-locks -c core.fsmonitor=false')).toBe(true)
+  })
+
+  test('calls out a rebase in progress and its conflicts', async ($, on) => {
+    const clock = mock.clock(on)
+    const status = '# branch.oid abc\n# branch.head (detached)\nu UU N... 1 1 1 1 a b c x.go\n'
+    on('session.cwd', () => ({ value: '/home/u/repo' }))
+    on('process.run', ($, e) => workspace(status)($, e))
+    on('fs.list', () => ({
+      value: ['HEAD', 'rebase-merge'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })),
+    }))
+    on('fs.read', ($, e) => ({ value: String(e.path).endsWith('msgnum') ? '3\n' : String(e.path).endsWith('end') ? '7\n' : '' }))
+
+    const pane = await $.ui.mount(PANE)
+    await clock.advance(5)
+    expect(await pane.find({ type: 'Text', text: 'REBASE 3/7' })).toBeDefined()
+    expect((await pane.find({ type: 'Text', text: '1 conflict' }))?.props['color']).toBe('error')
+    expect(await pane.find({ type: 'Text', text: 'detached @ abc' })).toBeDefined()
+  })
+
+  test('says a tree in step with its upstream is clean and synced', async ($, on) => {
+    const clock = mock.clock(on)
+    const status = '# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n'
+    on('session.cwd', () => ({ value: '/home/u/repo' }))
+    on('process.run', ($, e) => workspace(status, 'prod-eu\tapps\n')($, e))
+
+    const pane = await $.ui.mount(PANE)
+    await clock.advance(5)
+    expect(await pane.find({ type: 'Text', text: /REBASE|conflict/ })).toBeUndefined()
+    expect((await pane.find({ type: 'Text', text: 'prod-eu' }))?.props['color']).toBe('error')
+    expect(await pane.find({ type: 'Text', text: '✓ synced' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'clean' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /⌂/ })).toBeUndefined()
   })
 
   test('drops terminal control sequences a kubeconfig context name could carry', async ($, on) => {
